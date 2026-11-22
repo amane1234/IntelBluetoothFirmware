@@ -269,6 +269,26 @@ static LeMetaSlot *findOrAllocLeMetaSlotLocked(uint16_t handle, bool allocate)
     return nullptr;
 }
 
+// Drops whatever is still recorded for this connection handle. Duplicate reads can go unanswered
+// (the controller may reject them, or the link drops first) and handles are reused by later
+// connections: stale state would then rewrite the *real* features event of the next connection into a
+// fake PHY / Data Length event, and bluetoothd never finishes setting that connection up.
+static void clearLeMetaSlot(uint16_t handle)
+{
+    if (leMetaLock)
+        IOSimpleLockLock(leMetaLock);
+    LeMetaSlot *slot = findOrAllocLeMetaSlotLocked(handle, false);
+    if (slot) {
+        for (uint8_t i = 0; i < slot->pending; i++)
+            decrementRemoteReadCount();
+        slot->pending = 0;
+        slot->stage = 0;
+        slot->inUse = false;
+    }
+    if (leMetaLock)
+        IOSimpleLockUnlock(leMetaLock);
+}
+
 static bool addLeMetaPending(uint16_t handle, uint8_t count)
 {
     bool added = false;
@@ -310,7 +330,15 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
 
-    bool isIntelBT = (_hookDeviceInstance == nullptr || that == _hookDeviceInstance) &&
+    // Until the Intel pipe has been captured, only look at Intel devices: this hook sees the class
+    // requests of every USB device, and acting on look-alike opcodes of e.g. a HID device would
+    // inject Bluetooth commands into it.
+    bool isIntelDevice = (that == _hookDeviceInstance);
+    if (!isIntelDevice && _hookDeviceInstance == nullptr && that) {
+        const StandardUSB::DeviceDescriptor *desc = static_cast<IOUSBHostDevice *>(that)->getDeviceDescriptor();
+        isIntelDevice = desc && USBToHost16(desc->idVendor) == VENDOR_USB_INTEL;
+    }
+    bool isIntelBT = isIntelDevice &&
                      ((request.bmRequestType & kDeviceRequestDirectionMask) == kRequestDirectionOut) &&
                      (((request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase) == kRequestTypeClass);
 
@@ -372,7 +400,9 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 }
             }
         } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES && hdrLen >= 5) {
-            uint16_t handle = (uint16_t)hdr->data[0] | ((uint16_t)hdr->data[1] << 8);
+            uint16_t handle = ((uint16_t)hdr->data[0] | ((uint16_t)hdr->data[1] << 8)) & 0x0FFF;
+            // A new request starts a new 3-event sequence for this handle
+            clearLeMetaSlot(handle);
             // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
             // (1st dup -> fake PHY Update Complete, 2nd dup -> fake LE Data Length Change).
             for (int i = 0; i < 2; i++) {
@@ -404,6 +434,7 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
 }
 
+#define HCI_EVT_DISCONN_COMPLETE                      0x05
 #define HCI_EVT_LE_META                               0x3E
 #define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
 
@@ -423,8 +454,11 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
         if (prepared) {
             dataBuffer->readBytes(0, buffer, bytesTransferred);
             HciEventHdr *hdr = (HciEventHdr *)buffer;
-            if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                uint16_t handle = (uint16_t)hdr->data[2] | ((uint16_t)hdr->data[3] << 8);
+            if (hdr->evt == HCI_EVT_DISCONN_COMPLETE && bytesTransferred >= 6) {
+                // The link is gone: forget any duplicate events still expected for it
+                clearLeMetaSlot(((uint16_t)hdr->data[1] | ((uint16_t)hdr->data[2] << 8)) & 0x0FFF);
+            } else if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
+                uint16_t handle = ((uint16_t)hdr->data[2] | ((uint16_t)hdr->data[3] << 8)) & 0x0FFF;
                 uint8_t actionStage = 0;
                 if (leMetaLock)
                     IOSimpleLockLock(leMetaLock);
@@ -517,19 +551,19 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
     }
 }
 
-int CIntelBTPatcher::
+bool CIntelBTPatcher::
 newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::SuperSpeedEndpointCompanionDescriptor const *superDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char a7, unsigned short a8)
 {
-    int ret = FunctionCast(newInitPipe, callbackIBTPatcher->oldInitPipe)(that, descriptor, superDescriptor, controller, device, interface, a7, a8);
+    bool ret = FunctionCast(newInitPipe, callbackIBTPatcher->oldInitPipe)(that, descriptor, superDescriptor, controller, device, interface, a7, a8);
     if (ret)
         captureIntelInterruptPipe(that, descriptor, device);
     return ret;
 }
 
-int CIntelBTPatcher::
+bool CIntelBTPatcher::
 newInitPipeConfig(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::ConfigurationDescriptor const *configDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char a7, unsigned short a8)
 {
-    int ret = FunctionCast(newInitPipeConfig, callbackIBTPatcher->oldInitPipeConfig)(that, descriptor, configDescriptor, controller, device, interface, a7, a8);
+    bool ret = FunctionCast(newInitPipeConfig, callbackIBTPatcher->oldInitPipeConfig)(that, descriptor, configDescriptor, controller, device, interface, a7, a8);
     if (ret)
         captureIntelInterruptPipe(that, descriptor, device);
     return ret;
