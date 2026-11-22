@@ -192,6 +192,10 @@ protected:
     bool intelSendHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_t *size, int timeout);
     
     bool intelSendHCISyncEvent(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_t *size, uint8_t syncEvent, int timeout);
+
+    /* Reads interrupt events until the Intel vendor event (0xff) with the given sub-event code arrives,
+     * skipping unrelated events, or until timeoutMs passes. */
+    bool waitForVendorEvent(uint8_t subEvent, void *event, uint32_t eventBufSize, uint32_t *size, uint32_t timeoutMs);
     
     bool intelBulkHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_t *size, int timeout);
     

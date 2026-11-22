@@ -76,17 +76,88 @@ intelSendHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_
         XYLog("%s sendHCIRequest failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
         return false;
     }
-    if ((ret = m_pUSBDeviceController->interruptPipeRead(targetBuf, targetBufSize, targetSize, timeout)) != kIOReturnSuccess) {
-        XYLog("%s interruptPipeRead failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
-        return false;
+
+    /* The interrupt pipe does not only carry the answer to this command: a vendor event or a
+     * Command Complete for another opcode (e.g. the 0x0000 "ready" event) can arrive first.
+     * Taking the first packet as the answer made setup fail at random (wrong size, wrong data),
+     * so wait for the Command Complete / Command Status that belongs to this opcode. */
+    uint64_t deadline = 0;
+    uint64_t now = 0;
+    clock_interval_to_deadline(timeout > 0 ? (uint32_t)timeout : 1, kMillisecondScale, &deadline);
+    for (;;) {
+        clock_get_uptime(&now);
+        if (now >= deadline) {
+            XYLog("%s timeout waiting for the response to 0x%04x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode));
+            return false;
+        }
+        uint64_t remainingNs = 0;
+        absolutetime_to_nanoseconds(deadline - now, &remainingNs);
+        uint32_t remainingMs = (uint32_t)max((uint64_t)1, remainingNs / NSEC_PER_MSEC);
+
+        *targetSize = 0;
+        if ((ret = m_pUSBDeviceController->interruptPipeRead(targetBuf, targetBufSize, targetSize, remainingMs)) != kIOReturnSuccess) {
+            XYLog("%s interruptPipeRead failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
+            return false;
+        }
+        if (*targetSize < HCI_EVENT_HDR_SIZE)
+            continue;
+
+        HciResponse *resp = (HciResponse *)targetBuf;
+        if (resp->evt.evt == HCI_EV_CMD_COMPLETE && *targetSize >= 5 && resp->opcode == cmd->opcode) {
+            if (*targetSize >= 6 && resp->data[0] != 0x00) {
+                XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), resp->data[0]);
+                return false;
+            }
+            return true;
+        }
+        if (resp->evt.evt == HCI_EV_CMD_STATUS && *targetSize >= HCI_EVENT_HDR_SIZE + sizeof(HciCmdStatus)) {
+            HciCmdStatus *status = (HciCmdStatus *)((uint8_t *)targetBuf + HCI_EVENT_HDR_SIZE);
+            if (status->opcode == cmd->opcode) {
+                if (status->status != 0x00) {
+                    XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), status->status);
+                    return false;
+                }
+                return true;
+            }
+        }
+        XYLog("%s skipping event 0x%02x while waiting for 0x%04x\n", __FUNCTION__, resp->evt.evt, OSSwapLittleToHostInt16(cmd->opcode));
     }
-    HciResponse *resp = (HciResponse *)targetBuf;
-    if (*targetSize >= 6 && targetBufSize >= 6 && resp->evt.evt == HCI_EV_CMD_COMPLETE &&
-        resp->opcode == cmd->opcode && resp->data[0] != 0x00) {
-        XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, cmd->opcode, resp->data[0]);
+}
+
+bool BtIntel::
+waitForVendorEvent(uint8_t subEvent, void *event, uint32_t eventBufSize, uint32_t *size, uint32_t timeoutMs)
+{
+    if (!event || eventBufSize < 3)
         return false;
+
+    uint64_t deadline = 0;
+    uint64_t now = 0;
+    clock_interval_to_deadline(timeoutMs > 0 ? timeoutMs : 1, kMillisecondScale, &deadline);
+    for (;;) {
+        clock_get_uptime(&now);
+        if (now >= deadline) {
+            XYLog("%s timeout waiting for vendor event 0x%02x\n", __FUNCTION__, subEvent);
+            return false;
+        }
+        uint64_t remainingNs = 0;
+        absolutetime_to_nanoseconds(deadline - now, &remainingNs);
+        uint32_t remainingMs = (uint32_t)max((uint64_t)1, remainingNs / NSEC_PER_MSEC);
+
+        uint32_t localSize = 0;
+        IOReturn ret = m_pUSBDeviceController->interruptPipeRead(event, eventBufSize, &localSize, remainingMs);
+        if (ret != kIOReturnSuccess) {
+            XYLog("%s interruptPipeRead failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
+            return false;
+        }
+        if (size)
+            *size = localSize;
+
+        const uint8_t *bytes = (const uint8_t *)event;
+        if (localSize >= 3 && bytes[0] == 0xff && bytes[2] == subEvent)
+            return true;
+
+        XYLog("%s skipping event 0x%02x while waiting for vendor event 0x%02x\n", __FUNCTION__, localSize ? bytes[0] : 0, subEvent);
     }
-    return true;
 }
 
 bool BtIntel::
@@ -243,7 +314,6 @@ intelBoot(uint32_t bootAddr)
 {
     uint8_t buf[CMD_BUF_MAX_SIZE];
     uint32_t actLen = 0;
-    HciResponse *resp = (HciResponse *)buf;
 
     memset(buf, 0, sizeof(buf));
     
@@ -260,20 +330,14 @@ intelBoot(uint32_t bootAddr)
      * 1 second. However if that happens, then just fail the setup
      * since something went wrong.
      */
-    IOReturn ret = m_pUSBDeviceController->interruptPipeRead(buf, sizeof(buf), &actLen, 1000);
-    if (ret != kIOReturnSuccess || actLen < 3) {
-        XYLog("Intel boot failed\n");
-        if (ret == kIOReturnTimeout) {
-            XYLog("Reset to bootloader\n");
-            resetToBootloader();
-        }
+    // Other events may come first; wait specifically for the bootup notification (vendor event 0x02)
+    if (!waitForVendorEvent(0x02, buf, sizeof(buf), &actLen, 1000)) {
+        XYLog("Intel boot failed, reset to bootloader\n");
+        resetToBootloader();
         return false;
     }
-    if (resp->evt.evt == 0xff && resp->numCommands == 0x02) {
-        XYLog("Notify: Device reboot done\n");
-        return true;
-    }
-    return false;
+    XYLog("Notify: Device reboot done\n");
+    return true;
 }
 
 bool BtIntel::

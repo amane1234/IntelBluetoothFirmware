@@ -319,20 +319,23 @@ downloadFirmware(IntelVersionTLV *ver, uint32_t *bootParams)
      * of this device.
      */
     memset(buf, 0, sizeof(buf));
-    ior = m_pUSBDeviceController->interruptPipeRead(resp, sizeof(buf), &actSize, 5000);
-    if (ior != kIOReturnSuccess) {
+    // Unrelated events can arrive before the secure send result (vendor event 0x06); skip them
+    if (!waitForVendorEvent(0x06, resp, sizeof(buf), &actSize, 5000)) {
         XYLog("waiting for firmware download done timeout\n");
         resetToBootloader();
         ret = false;
         goto done;
     }
-    
-    if (resp->evt.evt == 0xff && resp->numCommands == 0x06) {
-        XYLog("Notify: Firmware download done\n");
+
+    // Secure send result: result, opcode (2), status. A non-zero result means the firmware was rejected.
+    if (actSize >= 4 && buf[3] != 0x00) {
+        XYLog("Firmware download failed, secure send result 0x%02x\n", buf[3]);
+        resetToBootloader();
+        ret = false;
         goto done;
     }
-    
-    ret = false;
+
+    XYLog("Notify: Firmware download done\n");
     
 done:
     OSSafeReleaseNULL(fwData);
