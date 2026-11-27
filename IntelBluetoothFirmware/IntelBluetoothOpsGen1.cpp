@@ -154,11 +154,12 @@ exit_mfg_deactivate:
     /* Patching failed. Disable the manufacturer mode with reset and
      * deactivate the downloaded firmware patches.
      */
+    OSSafeReleaseNULL(fwData);
     if (!exitMfg(true, false)) {
         XYLog("Exit mfg failed %d\n", __LINE__);
         return false;
     }
-    XYLog("Intel firmware patch completed and deactivated\n");
+    return false;
     
 complete:
     OSSafeReleaseNULL(fwData);

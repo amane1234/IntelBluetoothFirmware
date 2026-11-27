@@ -55,6 +55,7 @@ class IntelBluetoothOpsGen3 : public IntelBluetoothOpsGen2 {
     
 public:
     
+    bool isOperational();
     virtual bool setup() override;
     
     virtual bool shutdown() override;

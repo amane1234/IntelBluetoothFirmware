@@ -57,7 +57,7 @@ bootloaderSetup(IntelVersion *ver)
         return false;
     }
     
-    intelVersionInfo(&newVer);
+    if (!intelVersionInfo(&newVer) || newVer.fw_variant != 0x23) return false;
     
 finish:
     

@@ -25,10 +25,10 @@
 #include "BtIntel.h"
 
 enum BTType {
-    kTypeGen1,
-    kTypeGen2,
-    kTypeGen3,
-} ;
+    kTypeGen1 = 1,
+    kTypeGen2 = 2,
+    kTypeGen3 = 3,
+};
 
 class IntelBluetoothFirmware : public IOService
 {
@@ -42,6 +42,8 @@ public:
     
     bool start(IOService *provider) override;
     
+    bool willTerminate(IOService *provider, IOOptionBits options) override;
+    void updateCapabilities(uint32_t caps);
     void stop(IOService *provider) override;
     
     IOService * probe(IOService *provider, SInt32 *score) override;
@@ -50,12 +52,27 @@ public:
     
     void cleanUp();
     
-    void publishReg(bool isSucceed, const char *fwName);
+    void publishReg(IOUSBHostDevice *dev, bool isSucceed, const char *fwName);
     
 private:
-    BTType currentType;
-    BtIntel *m_pBTIntel;
-    IOUSBHostDevice* m_pDevice;
+    bool fail();
+    void scheduleVerification(IOUSBHostDevice *dev);
+    struct WakeJob;
+    static void verifyWake(void *context, wait_result_t);
+    IOLock *stateLock {nullptr};
+    uint64_t generation {0};
+    bool needsVerify {false};
+    bool fullWake {true};
+    bool pending {false};
+    bool started {false};
+    bool terminating {false};
+    IONotifier *wakeNotifier {nullptr};
+    unsigned long lastPowerState {~0UL};
+    IntelVersion gen1Baseline {};
+    BTType currentType {kTypeGen2};
+    BtIntel *m_pBTIntel {nullptr};
+    IOUSBHostDevice* m_pDevice {nullptr};
+    bool m_pmStarted {false};
 };
 
 #endif

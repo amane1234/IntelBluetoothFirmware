@@ -44,7 +44,7 @@ bootloaderSetupTLV(IntelVersionTLV *verTLV)
 {
     uint32_t bootParams;
     char ddcname[64];
-    IntelVersionTLV newVerTLV;
+    IntelVersionTLV newVerTLV {};
     
     /* Set the default boot parameter to 0x0 and it is updated to
      * SKU specific boot parameter after reading Intel_Write_Boot_Params
@@ -84,7 +84,7 @@ bootloaderSetupTLV(IntelVersionTLV *verTLV)
         return false;
     }
     
-    versionInfoTLV(&newVerTLV);
+    if (!versionInfoTLV(&newVerTLV) || newVerTLV.img_type != 3) return false;
     
 finish:
     /* Set the event mask for Intel specific vendor events. This enables
@@ -97,6 +97,21 @@ finish:
     setEventMask(false);
     
     return true;
+}
+
+bool IntelBluetoothOpsGen3::isOperational()
+{
+    uint8_t raw[CMD_BUF_MAX_SIZE] {};
+    int n = readVersionTyP(raw);
+    if (n == sizeof(IntelVersion)) {
+        auto ver = reinterpret_cast<IntelVersion *>(raw);
+        return intelVersionInfo(ver) && ver->fw_variant == 0x23;
+    }
+    IntelVersionTLV tlv {};
+    if (n > 0 && parseVersionTLV(&tlv, raw, n) && versionInfoTLV(&tlv))
+        return tlv.img_type == 3;
+    IntelVersion legacy {};
+    return readVersion(&legacy) && intelVersionInfo(&legacy) && legacy.fw_variant == 0x23;
 }
 
 bool IntelBluetoothOpsGen3::
@@ -124,7 +139,7 @@ setup()
         XYLog("Read the legacy Intel version information\n");
         
         /* Display version information */
-        intelVersionInfo(verPtr);
+        if (!intelVersionInfo(verPtr)) return false;
         
         /* Check for supported iBT hardware variants of this firmware
          * loading method.
@@ -168,8 +183,7 @@ setup()
     if (INTEL_HW_PLATFORM(verTLV.cnvi_bt) != 0x37) {
         XYLog("Unsupported Intel hardware platform (0x%2x)\n",
               INTEL_HW_PLATFORM(verTLV.cnvi_bt));
-        // TODO: We found that the Gen 2 bluetooth may return different size with IntelVersion when in OPERATIONAL mode, then the code will go here, considering we will not attach the really unsupported device to this driver, so we fake it as firmware loaded done here.
-        return true;
+        return readVersion(verPtr) && intelVersionInfo(verPtr) && verPtr->fw_variant == 0x23;
     }
     
     /* Check for supported iBT hardware variants of this firmware
@@ -219,7 +233,7 @@ setup()
         case 0x1c:
         case 0x1d:      /* BlazarU (BzrU) - BE200/BE201 class */
             /* Display version information of TLV type */
-            versionInfoTLV(&verTLV);
+            if (!versionInfoTLV(&verTLV)) return false;
             
             if (!bootloaderSetupTLV(&verTLV)) {
                 return false;

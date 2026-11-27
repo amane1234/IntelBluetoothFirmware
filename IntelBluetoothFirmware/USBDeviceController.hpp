@@ -19,11 +19,8 @@
 
 #include "Hci.h"
 
-typedef struct {
-    int status;
-    uint32_t dataLen;
-    bool done;
-} InterruptResp;
+
+struct InterruptRead;
 
 class USBDeviceController : public OSObject {
     OSDeclareDefaultStructors(USBDeviceController)
@@ -61,7 +58,9 @@ private:
     IOUSBHostPipe* m_pBulkWritePipe;
     IOUSBHostPipe* m_pBulkReadPipe;
     
-    IOLock *_hciLock;
+
+    IOBufferMemoryDescriptor *bulkBuffer {nullptr};
+    InterruptRead *cachedRead {nullptr};
     IOBufferMemoryDescriptor* mReadBuffer;
 };
 

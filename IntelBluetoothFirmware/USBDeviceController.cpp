@@ -22,10 +22,6 @@ init(IOService *client, IOUSBHostDevice *dev)
     if (!super::init()) {
         return false;
     }
-    _hciLock = IOLockAlloc();
-    if (!_hciLock) {
-        return false;
-    }
     mReadBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task
                                                               , kIODirectionIn, kReadBufferSize);
     if (!mReadBuffer) {
@@ -33,7 +29,10 @@ init(IOService *client, IOUSBHostDevice *dev)
         return false;
     }
     
-    mReadBuffer->prepare(kIODirectionIn);
+    if (mReadBuffer->prepare(kIODirectionIn) != kIOReturnSuccess) {
+        OSSafeReleaseNULL(mReadBuffer);
+        return false;
+    }
     m_pDevice = dev;
     m_pClient = client;
     return true;
@@ -69,6 +68,8 @@ findInterface()
     return true;
 }
 
+static void releaseRead(InterruptRead *);
+
 void USBDeviceController::
 free()
 {
@@ -85,13 +86,11 @@ free()
         m_pInterruptReadPipe->abort();
         OSSafeReleaseNULL(m_pInterruptReadPipe);
     }
+    if (cachedRead) releaseRead(cachedRead);
+    OSSafeReleaseNULL(bulkBuffer);
     if (mReadBuffer) {
         mReadBuffer->complete(kIODirectionIn);
         OSSafeReleaseNULL(mReadBuffer);
-    }
-    if (_hciLock) {
-        IOLockFree(_hciLock);
-        _hciLock = NULL;
     }
     if (m_pInterface) {
         if (m_pClient && m_pInterface->isOpen(m_pClient)) {
@@ -188,7 +187,7 @@ bulkPipeRead(void *buf, uint32_t buf_size, uint32_t *size, uint32_t timeout)
     }
     if (ret == kIOReturnSuccess) {
         if (buf && actualLength > buf_size) {
-            XYLog("%s buf size too small. buflen: %d act: %d\n", __FUNCTION__, buf_size, actualLength);
+            return kIOReturnOverrun;
         }
         if (buf) {
             memcpy(buf, mReadBuffer->getBytesNoCopy(), min(actualLength, buf_size));
@@ -202,90 +201,93 @@ bulkPipeRead(void *buf, uint32_t buf_size, uint32_t *size, uint32_t timeout)
     return ret;
 }
 
-void USBDeviceController::
-interruptHandler(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred)
+// The waiter and the USB completion own separate references. A timeout can
+// return before the cancellation callback without exposing stack memory.
+struct InterruptRead {
+    int refs;
+    IOLock *lock;
+    IOBufferMemoryDescriptor *buffer;
+    IOUSBHostCompletion completion;
+    bool done;
+    IOReturn status;
+    uint32_t transferred;
+};
+
+static void releaseRead(InterruptRead *read)
 {
-    USBDeviceController *controller = OSDynamicCast(USBDeviceController, (OSObject *)owner);
-    if (!controller || !parameter) {
-        return;
+    if (__atomic_sub_fetch(&read->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        OSSafeReleaseNULL(read->buffer);
+        if (read->lock)
+            IOLockFree(read->lock);
+        IOFree(read, sizeof(*read));
     }
-    switch (status) {
-        case kIOReturnSuccess:
-            break;
-        default:
-            XYLog("%s status: %s (%d) len: %d\n", __FUNCTION__, controller->stringFromReturn(status), status, bytesTransferred);
-            break;
-    }
-    
-    IOLockLock(controller->_hciLock);
-    InterruptResp *resp = (InterruptResp *)parameter;
-    resp->status = status;
-    resp->dataLen = bytesTransferred;
-    resp->done = true;
-    IOLockWakeup(controller->_hciLock, controller, true);
-    IOLockUnlock(controller->_hciLock);
+}
+
+void USBDeviceController::
+interruptHandler(void *owner, void *, IOReturn status, uint32_t bytesTransferred)
+{
+    auto read = static_cast<InterruptRead *>(owner);
+    IOLockLock(read->lock);
+    read->status = status;
+    read->transferred = bytesTransferred;
+    read->done = true;
+    IOLockWakeup(read->lock, read, true);
+    IOLockUnlock(read->lock);
+    releaseRead(read);
 }
 
 IOReturn USBDeviceController::
-interruptPipeRead(void *buf, uint32_t buf_size, uint32_t *size, uint32_t timeout)
+interruptPipeRead(void *buf, uint32_t capacity, uint32_t *size, uint32_t timeout)
 {
-    AbsoluteTime deadline;
-    IOUSBHostCompletion comple;
-    InterruptResp interrupResp;
-    
-    clock_interval_to_deadline(timeout, kMillisecondScale, reinterpret_cast<uint64_t*> (&deadline));
-    memset(&interrupResp, 0, sizeof(interrupResp));
-    interrupResp.done = false;
-    comple.action = interruptHandler;
-    comple.owner = this;
-    comple.parameter = &interrupResp;
-    
-    IOReturn ret = m_pInterruptReadPipe->io(mReadBuffer, (uint32_t)mReadBuffer->getLength(), &comple, 0);
-    if (ret == kIOUSBPipeStalled) {
-        m_pInterruptReadPipe->clearStall(true);
-        ret = m_pInterruptReadPipe->io(mReadBuffer, (uint32_t)mReadBuffer->getLength(), &comple, 0);
+    if (size)
+        *size = 0;
+    auto read = __atomic_exchange_n(&cachedRead, nullptr, __ATOMIC_ACQ_REL);
+    if (!read) {
+        read = static_cast<InterruptRead *>(IOMallocZero(sizeof(InterruptRead)));
+        if (!read) return kIOReturnNoMemory;
+        read->refs = 1;
+        read->lock = IOLockAlloc();
+        read->buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionIn, kReadBufferSize);
+        if (!read->lock || !read->buffer) {
+            releaseRead(read);
+            return kIOReturnNoMemory;
+        }
+        read->completion.owner = read;
+        read->completion.action = interruptHandler;
     }
-    
-    if (ret == kIOReturnSuccess) {
-        IOLockLock(_hciLock);
-        while (!interrupResp.done) {
-            if (IOLockSleepDeadline(_hciLock, this, deadline, THREAD_UNINT) != THREAD_AWAKENED) {
-                break;
-            }
-        }
-        bool completed = interrupResp.done;
-        IOLockUnlock(_hciLock);
-
-        if (!completed) {
-            m_pInterruptReadPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted);
-            XYLog("%s Timeout\n", __FUNCTION__);
-            return kIOReturnTimeout;
-        }
-
-        if (interrupResp.status != kIOReturnSuccess) {
-            if (interrupResp.status == kIOUSBPipeStalled) {
-                m_pInterruptReadPipe->clearStall(true);
-            }
-            XYLog("%s completion failed: %s (%d)\n", __FUNCTION__, stringFromReturn(interrupResp.status), interrupResp.status);
-            return interrupResp.status;
-        }
-
-        if (interrupResp.dataLen <= 0) {
-            XYLog("%s invalid response size: %d\n", __FUNCTION__, interrupResp.dataLen);
-            return kIOReturnError;
-        }
-        if (buf && interrupResp.dataLen > buf_size) {
-            XYLog("%s buf size too small. buflen: %d act: %d\n", __FUNCTION__, buf_size, interrupResp.dataLen);
-        }
-        if (buf) {
-            memcpy(buf, mReadBuffer->getBytesNoCopy(), min(interrupResp.dataLen, buf_size));
-        }
-        if (size) {
-            *size = min(interrupResp.dataLen, buf_size);
-        }
+    read->done = false;
+    __atomic_add_fetch(&read->refs, 1, __ATOMIC_RELAXED);
+    uint64_t deadline;
+    clock_interval_to_deadline(timeout, kMillisecondScale, &deadline);
+    auto ret = m_pInterruptReadPipe->io(read->buffer, kReadBufferSize, &read->completion, 0);
+    if (ret == kIOUSBPipeStalled && m_pInterruptReadPipe->clearStall(true) == kIOReturnSuccess)
+        ret = m_pInterruptReadPipe->io(read->buffer, kReadBufferSize, &read->completion, 0);
+    if (ret != kIOReturnSuccess) {
+        releaseRead(read); // USB did not accept the transfer.
     } else {
-        XYLog("%s failed: %s %d\n", __FUNCTION__, stringFromReturn(ret), ret);
+        IOLockLock(read->lock);
+        while (!read->done) {
+            if (IOLockSleepDeadline(read->lock, read, deadline, THREAD_UNINT) != THREAD_AWAKENED)
+                break;
+        }
+        bool expired = !read->done;
+        ret = expired ? kIOReturnTimeout : read->status;
+        if (!ret && (!read->transferred || read->transferred > kReadBufferSize ||
+                     (buf && read->transferred > capacity)))
+            ret = kIOReturnBadMedia;
+        if (!ret) {
+            if (buf)
+                memcpy(buf, read->buffer->getBytesNoCopy(), read->transferred);
+            if (size)
+                *size = read->transferred;
+        }
+        IOLockUnlock(read->lock);
+        if (expired)
+            m_pInterruptReadPipe->abort(IOUSBHostIOSource::kAbortAsynchronous);
     }
+    InterruptRead *empty = nullptr;
+    if (ret || !__atomic_compare_exchange_n(&cachedRead, &empty, read, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+        releaseRead(read);
     return ret;
 }
 
@@ -302,37 +304,24 @@ sendHCIRequest(HciCommandHdr *cmd, uint32_t timeout)
         .wLength = (uint16_t)(HCI_COMMAND_HDR_SIZE + cmd->len)
     };
     
-    return m_pInterface->deviceRequest(request, cmd, actualLength, timeout);
+    auto ret = m_pDevice->deviceRequest(m_pClient, request, cmd, actualLength, timeout);
+    return !ret && actualLength != request.wLength ? kIOReturnUnderrun : ret;
 }
 
 IOReturn USBDeviceController::
 bulkWrite(const void *data, uint32_t length, uint32_t timeout)
 {
-    IOMemoryDescriptor* buffer = IOMemoryDescriptor::withAddress((void *)data, length, kIODirectionOut);
-    if (!buffer) {
-        XYLog("Unable to allocate bulk write buffer.\n");
-        return kIOReturnNoMemory;
-    }
-    IOReturn ret;
-    uint32_t actLen = 0;
-    if ((ret = buffer->prepare(kIODirectionOut)) != kIOReturnSuccess) {
-        XYLog("Failed to prepare bulk write memory buffer (error %d).\n", ret);
-        buffer->release();
-        return ret;
-    }
-    if ((ret = m_pBulkWritePipe->io(buffer, (uint32_t)buffer->getLength(), actLen, timeout)) != kIOReturnSuccess) {
-        XYLog("Failed to write to bulk pipe (error %d)\n", ret);
-        buffer->complete(kIODirectionOut);
-        buffer->release();
-        return ret;
-    }
-    if ((ret = buffer->complete(kIODirectionOut)) != kIOReturnSuccess) {
-        XYLog("Failed to complete bulk write memory buffer (error %d)\n", ret);
-        buffer->release();
-        return ret;
-    }
-    buffer->release();
-    return ret;
+    if (!data || !length || length > 258 || !m_pBulkWritePipe)
+        return kIOReturnBadArgument;
+    // The loader submits one firmware fragment and waits for its acknowledgement
+    // before sending the next. Keep one writable descriptor for that sequence.
+    if (!bulkBuffer)
+        bulkBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionOut, 258);
+    if (!bulkBuffer) return kIOReturnNoMemory;
+    memcpy(bulkBuffer->getBytesNoCopy(), data, length);
+    uint32_t transferred = 0;
+    auto result = m_pBulkWritePipe->io(bulkBuffer, length, transferred, timeout);
+    return !result && transferred != length ? kIOReturnUnderrun : result;
 }
 
 const char* USBDeviceController::

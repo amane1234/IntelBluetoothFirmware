@@ -20,6 +20,8 @@ typedef struct {
     void *owner;
     IOMemoryDescriptor *dataBuffer;
     IOUSBHostCompletionAction action;
+    uint64_t generation;
+    int poolSlot;
 } AsyncOwnerData;
 
 typedef struct __attribute__((packed))
@@ -89,6 +91,7 @@ public:
     mach_vm_address_t oldInitPipeConfig {};
     
 private:
+    static bool detached(void *, void *, IOService *, IONotifier *);
     static void captureIntelInterruptPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, IOUSBHostDevice *device);
     static void *_hookPipeInstance;
     static IOUSBHostDevice *_hookDeviceInstance;

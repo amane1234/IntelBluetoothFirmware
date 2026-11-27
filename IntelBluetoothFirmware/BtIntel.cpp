@@ -18,7 +18,7 @@
 OSDefineMetaClassAndAbstractStructors(BtIntel, OSObject)
 
 bool BtIntel::
-initWithDevice(IOService *client, IOUSBHostDevice *dev)
+initWithDevice(IOService *client, IOUSBHostDevice *dev, bool configure)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     if (!super::init()) {
@@ -30,7 +30,7 @@ initWithDevice(IOService *client, IOUSBHostDevice *dev)
     if (!m_pUSBDeviceController || !m_pUSBDeviceController->init(client, dev)) {
         return false;
     }
-    if (!m_pUSBDeviceController->initConfiguration()) {
+    if (configure && !m_pUSBDeviceController->initConfiguration()) {
         return false;
     }
     if (!m_pUSBDeviceController->findInterface()) {
@@ -103,7 +103,8 @@ intelSendHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_
             continue;
 
         HciResponse *resp = (HciResponse *)targetBuf;
-        if (resp->evt.evt == HCI_EV_CMD_COMPLETE && *targetSize >= 5 && resp->opcode == cmd->opcode) {
+        if (*targetSize != 2U + resp->evt.len) return false;
+        if (resp->evt.evt == HCI_EV_CMD_COMPLETE && *targetSize >= 6 && resp->opcode == cmd->opcode) {
             if (*targetSize >= 6 && resp->data[0] != 0x00) {
                 XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), resp->data[0]);
                 return false;
@@ -117,7 +118,7 @@ intelSendHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_
                     XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), status->status);
                     return false;
                 }
-                return true;
+                continue; // status acknowledges submission; wait for command complete
             }
         }
         XYLog("%s skipping event 0x%02x while waiting for 0x%04x\n", __FUNCTION__, resp->evt.evt, OSSwapLittleToHostInt16(cmd->opcode));
@@ -153,8 +154,11 @@ waitForVendorEvent(uint8_t subEvent, void *event, uint32_t eventBufSize, uint32_
             *size = localSize;
 
         const uint8_t *bytes = (const uint8_t *)event;
-        if (localSize >= 3 && bytes[0] == 0xff && bytes[2] == subEvent)
+        if (localSize >= 3 && localSize == 2U + bytes[1] && bytes[0] == 0xff && bytes[2] == subEvent) {
+            if (subEvent == 2) return localSize == 9;
+            if (subEvent == 6) return localSize == 7 && !bytes[3] && !bytes[6];
             return true;
+        }
 
         XYLog("%s skipping event 0x%02x while waiting for vendor event 0x%02x\n", __FUNCTION__, localSize ? bytes[0] : 0, subEvent);
     }
@@ -218,13 +222,9 @@ intelBulkHCISync(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, uint32_
         XYLog("%s bulkPipeRead failed: %s %d\n", __FUNCTION__, m_pUSBDeviceController->stringFromReturn(ret), ret);
         return false;
     }
-    HciResponse *resp = (HciResponse *)targetBuf;
-    if (*targetSize >= 6 && targetBufSize >= 6 && resp->evt.evt == HCI_EV_CMD_COMPLETE &&
-        resp->opcode == cmd->opcode && resp->data[0] != 0x00) {
-        XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, cmd->opcode, resp->data[0]);
-        return false;
-    }
-    return true;
+    const auto *resp = static_cast<const HciResponse *>(targetBuf);
+    return *targetSize >= 6 && *targetSize == 2U + resp->evt.len &&
+           resp->evt.evt == HCI_EV_CMD_COMPLETE && resp->opcode == cmd->opcode && !resp->data[0];
 }
 
 bool BtIntel::
