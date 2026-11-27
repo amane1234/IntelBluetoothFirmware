@@ -17,7 +17,6 @@
 #include "Hci.h"
 #include "linux.h"
 #include "Log.h"
-#include <kern/thread.h>
 
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
@@ -130,21 +129,13 @@ bool IntelBluetoothFirmware::start(IOService *provider)
         m_pDevice->setProperty("FirmwareLoaded", false);
         return fail();
     }
-    if (currentType == kTypeGen1) {
-        IntelVersion baseline {};
-        if (!m_pBTIntel->readVersion(&baseline) || baseline.hw_platform != 0x37)
-            return fail();
-        gen1Baseline = baseline;
-    }
     m_pBTIntel->getFirmwareName(fwName, sizeof(fwName));
     // Close the firmware pipes and the device before allowing the host to submit its
     // first command: FirmwareLoaded is what lets the HCI hook pass host commands.
     IOUSBHostDevice *dev = m_pDevice;
     cleanUp();
     IOLockLock(stateLock);
-    started = true;
-    publishReg(dev, !needsVerify && !terminating, fwName);
-    scheduleVerification(dev);
+    publishReg(dev, !terminating, fwName);
     IOLockUnlock(stateLock);
     return true;
 }
@@ -173,116 +164,34 @@ void IntelBluetoothFirmware::cleanUp()
     }
 }
 
-struct IntelBluetoothFirmware::WakeJob {
-    IntelBluetoothFirmware *service;
-    IOUSBHostDevice *dev;
-    uint64_t generation;
-};
-
-// Called with stateLock held. USB transactions must run outside PM and port workloops.
-void IntelBluetoothFirmware::scheduleVerification(IOUSBHostDevice *dev)
-{
-    if (!dev || !started || terminating || !needsVerify || !fullWake || pending ||
-        lastPowerState == kMyOffPowerState)
-        return;
-    auto job = static_cast<WakeJob *>(IOMalloc(sizeof(WakeJob)));
-    if (!job) return;
-    *job = {this, dev, generation};
-    retain();
-    dev->retain();
-    pending = true;
-    thread_t thread;
-    if (kernel_thread_start(verifyWake, job, &thread) == KERN_SUCCESS) {
-        thread_deallocate(thread);
-        return;
-    }
-    pending = false;
-    dev->release();
-    release();
-    IOFree(job, sizeof(*job));
-}
-
-void IntelBluetoothFirmware::verifyWake(void *context, wait_result_t)
-{
-    auto job = static_cast<WakeJob *>(context);
-    auto self = job->service;
-    auto dev = job->dev;
-    bool verified = false;
-    bool current = false;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
-        IOLockLock(self->stateLock);
-        current = !self->terminating && self->fullWake && self->generation == job->generation;
-        IOLockUnlock(self->stateLock);
-        if (!current || dev->isInactive()) break;
-        if (dev->open(self)) {
-            auto ops = new IntelBluetoothOpsGen3();
-            if (ops && ops->initWithDevice(self, dev, false)) {
-                if (self->currentType == kTypeGen1) {
-                    IntelVersion ver {};
-                    verified = ops->readVersion(&ver) &&
-                               !memcmp(&ver, &self->gen1Baseline, sizeof(ver));
-                } else {
-                    verified = ops->isOperational();
-                }
-            }
-            OSSafeReleaseNULL(ops);
-            dev->close(self);
-        }
-        if (verified) break;
-        if (attempt < 2) IOSleep(100U << attempt);
-    }
-    IOLockLock(self->stateLock);
-    current = !self->terminating && self->generation == job->generation && self->fullWake;
-    if (current && verified) {
-        self->needsVerify = false;
-        dev->setProperty("FirmwareLoaded", true);
-    }
-    IOLockUnlock(self->stateLock);
-    // A busy host interface cannot be borrowed. A new USB attachment runs the
-    // normal loader, including firmware download if power was lost.
-    if (current && !verified && !dev->isInactive()) {
-        auto ret = dev->reset();
-        if (ret) XYLog("Wake re-enumeration failed: %d\n", ret);
-    }
-    IOLockLock(self->stateLock);
-    self->pending = false;
-    if (self->generation != job->generation)
-        self->scheduleVerification(dev);
-    IOLockUnlock(self->stateLock);
-    dev->release();
-    self->release();
-    IOFree(job, sizeof(*job));
-}
-
+// Sleep and wake need no action from the loader. The controller keeps its firmware while the USB
+// device stays attached, and Apple's transport suspends and resumes it with its own HCI traffic,
+// which must go through untouched. When the controller loses power (S4, or S3 with the port
+// unpowered) the USB device disconnects and comes back as a new IOUSBHostDevice, which the normal
+// probe/start path loads again; even a chip reset into the bootloader re-enumerates.
+//
+// The earlier wake verification did more harm than that: it cleared FirmwareLoaded on the way to
+// sleep, so IntelBTPatcher refused the transport's pre-sleep and post-wake commands, and after a
+// full wake it tried to open the device and interface the transport holds. That always failed, so
+// every wake ended in a forced USB reset, or with Bluetooth refused for good when the reset did not
+// re-enumerate.
 void IntelBluetoothFirmware::updateCapabilities(uint32_t caps)
 {
     IOLockLock(stateLock);
     auto dev = OSDynamicCast(IOUSBHostDevice, getProvider());
-    bool full = (caps & kIOPMSystemCapabilityGraphics) && (caps & kIOPMSystemCapabilityCPU);
-    if (fullWake != full) ++generation;
-    fullWake = full;
-    if (dev && !terminating && !(caps & kIOPMSystemCapabilityCPU) && !needsVerify) {
+    // Going to sleep: a new generation makes IntelBTPatcher drop its LE and random address state
+    // on the next command, so the address is sent again after wake.
+    if (dev && !terminating && !(caps & kIOPMSystemCapabilityCPU)) {
         ++generation;
         dev->setProperty("IntelBTFirmwareGeneration", generation, 64);
-        needsVerify = true;
-        dev->setProperty("FirmwareLoaded", false);
     }
-    scheduleVerification(dev);
     IOLockUnlock(stateLock);
 }
 
 IOReturn IntelBluetoothFirmware::setPowerState(unsigned long ordinal, IOService *what)
 {
-    if (what != this || ordinal > kMyOnPowerState) return IOPMAckImplied;
-    IOLockLock(stateLock);
-    auto dev = OSDynamicCast(IOUSBHostDevice, getProvider());
-    if (dev && ordinal != lastPowerState && !terminating) {
-        bool asleep = ordinal == kMyOffPowerState;
-        lastPowerState = ordinal;
-        dev->setProperty("IntelBTTransportAsleep", asleep);
-        scheduleVerification(dev);
-    }
-    IOLockUnlock(stateLock);
+    if (what == this && ordinal <= kMyOnPowerState)
+        XYLog("power state %lu\n", ordinal);
     return IOPMAckImplied;
 }
 

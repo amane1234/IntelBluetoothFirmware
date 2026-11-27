@@ -18,7 +18,7 @@
 OSDefineMetaClassAndAbstractStructors(BtIntel, OSObject)
 
 bool BtIntel::
-initWithDevice(IOService *client, IOUSBHostDevice *dev, bool configure)
+initWithDevice(IOService *client, IOUSBHostDevice *dev)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     if (!super::init()) {
@@ -30,7 +30,7 @@ initWithDevice(IOService *client, IOUSBHostDevice *dev, bool configure)
     if (!m_pUSBDeviceController || !m_pUSBDeviceController->init(client, dev)) {
         return false;
     }
-    if (configure && !m_pUSBDeviceController->initConfiguration()) {
+    if (!m_pUSBDeviceController->initConfiguration()) {
         return false;
     }
     if (!m_pUSBDeviceController->findInterface()) {

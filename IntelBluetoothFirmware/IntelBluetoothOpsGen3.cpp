@@ -99,21 +99,6 @@ finish:
     return true;
 }
 
-bool IntelBluetoothOpsGen3::isOperational()
-{
-    uint8_t raw[CMD_BUF_MAX_SIZE] {};
-    int n = readVersionTyP(raw);
-    if (n == sizeof(IntelVersion)) {
-        auto ver = reinterpret_cast<IntelVersion *>(raw);
-        return intelVersionInfo(ver) && ver->fw_variant == 0x23;
-    }
-    IntelVersionTLV tlv {};
-    if (n > 0 && parseVersionTLV(&tlv, raw, n) && versionInfoTLV(&tlv))
-        return tlv.img_type == 3;
-    IntelVersion legacy {};
-    return readVersion(&legacy) && intelVersionInfo(&legacy) && legacy.fw_variant == 0x23;
-}
-
 bool IntelBluetoothOpsGen3::
 setup()
 {

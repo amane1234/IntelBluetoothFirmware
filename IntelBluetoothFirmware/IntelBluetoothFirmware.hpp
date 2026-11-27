@@ -56,19 +56,10 @@ public:
     
 private:
     bool fail();
-    void scheduleVerification(IOUSBHostDevice *dev);
-    struct WakeJob;
-    static void verifyWake(void *context, wait_result_t);
     IOLock *stateLock {nullptr};
     uint64_t generation {0};
-    bool needsVerify {false};
-    bool fullWake {true};
-    bool pending {false};
-    bool started {false};
     bool terminating {false};
     IONotifier *wakeNotifier {nullptr};
-    unsigned long lastPowerState {~0UL};
-    IntelVersion gen1Baseline {};
     BTType currentType {kTypeGen2};
     BtIntel *m_pBTIntel {nullptr};
     IOUSBHostDevice* m_pDevice {nullptr};
