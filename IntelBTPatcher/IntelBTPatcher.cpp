@@ -83,6 +83,10 @@ static IONotifier *detachNotifier;
 static AsyncOwnerData completionPool[16];
 static bool poolBusy[16];
 static bool randomAddressError;
+// Injected commands wait for a free command slot (Num_HCI_Command_Packets of the last Command
+// Complete/Status). Log once when that skips them, so a controller that only reports one slot,
+// which the host command itself uses, shows up in the log instead of silently losing both fixes.
+static bool loggedNoAddressCredit, loggedNoDuplicateCredit;
 
 bool CIntelBTPatcher::init()
 {
@@ -142,7 +146,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 DBGLOG(DRV_NAME, "routed %s", findQueueRequestRequest.symbol);
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", findQueueRequestRequest.symbol, patcher.getError());
+                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", findQueueRequestRequest.symbol, static_cast<int>(patcher.getError()));
                 patcher.clearError();
             }
             
@@ -160,7 +164,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 SYSLOG(DRV_NAME, "routed %s", hostDeviceRequest.symbol);
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError());
+                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, static_cast<int>(patcher.getError()));
                 patcher.clearError();
             }
 
@@ -173,7 +177,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 SYSLOG(DRV_NAME, "routed %s", asyncIORequest.symbol);
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", asyncIORequest.symbol, patcher.getError());
+                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", asyncIORequest.symbol, static_cast<int>(patcher.getError()));
                 patcher.clearError();
             }
 
@@ -187,7 +191,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 SYSLOG(DRV_NAME, "routed %s", initPipeConfigRequest.symbol);
             } else {
-                DBGLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeConfigRequest.symbol, patcher.getError());
+                DBGLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeConfigRequest.symbol, static_cast<int>(patcher.getError()));
                 patcher.clearError();
             }
 
@@ -200,7 +204,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 SYSLOG(DRV_NAME, "routed %s", initPipeRequest.symbol);
             } else {
-                DBGLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeRequest.symbol, patcher.getError());
+                DBGLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeRequest.symbol, static_cast<int>(patcher.getError()));
                 patcher.clearError();
             }
         }
@@ -391,11 +395,14 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
             IOSimpleLockLock(leMetaLock);
             if (randomAddressError) { _randomAddressInit = false; randomAddressError = false; }
             bool send = epoch == generation && !_randomAddressInit && commandCredits;
+            bool noCredit = epoch == generation && !_randomAddressInit && !commandCredits;
             if (send) {
                 _randomAddressInit = true;
                 --commandCredits;
             }
             IOSimpleLockUnlock(leMetaLock);
+            if (noCredit && !__atomic_exchange_n(&loggedNoAddressCredit, true, __ATOMIC_RELAXED))
+                SYSLOG(DRV_NAME, "random address not sent: no free HCI command slot (further skips are not logged)");
             if (send) {
                 auto addressRequest = request;
                 addressRequest.wLength = sizeof(randomAddressHci);
@@ -416,6 +423,8 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
             auto dupRequest = request;
             unsigned reserved = 0;
             while (reserved < 2 && addLeMetaPending(handle, 1, epoch)) ++reserved;
+            if (reserved < 2 && !__atomic_exchange_n(&loggedNoDuplicateCredit, true, __ATOMIC_RELAXED))
+                SYSLOG(DRV_NAME, "LE Read Remote Features: %u of 2 duplicates reserved, no free HCI command slot or tracking slot (further skips are not logged)", reserved);
             if (reserved) {
                 dev->retain();
                 if (provider) provider->retain();

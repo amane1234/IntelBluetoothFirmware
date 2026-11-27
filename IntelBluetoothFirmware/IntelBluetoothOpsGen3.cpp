@@ -452,7 +452,14 @@ downloadFirmwareData(IntelVersionTLV *ver, OSData *fwData, uint32_t *bootParams,
             if (!downloadFirmwarePayload(fwData, RSA_HEADER_LEN + ECDSA_HEADER_LEN)) {
                 return kIOReturnError;
             }
+        } else {
+            // Nothing would be sent and the setup would only time out waiting for the result.
+            XYLog("Unsupported secure boot engine type (%d)\n", sbeType);
+            return kIOReturnUnsupported;
         }
+    } else {
+        XYLog("Unsupported hardware variant for TLV download (0x%x)\n", hwVariant);
+        return kIOReturnUnsupported;
     }
     
     return kIOReturnSuccess;

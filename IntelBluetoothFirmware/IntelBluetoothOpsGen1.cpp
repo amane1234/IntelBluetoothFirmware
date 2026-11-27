@@ -154,12 +154,15 @@ exit_mfg_deactivate:
     /* Patching failed. Disable the manufacturer mode with reset and
      * deactivate the downloaded firmware patches.
      */
-    OSSafeReleaseNULL(fwData);
     if (!exitMfg(true, false)) {
         XYLog("Exit mfg failed %d\n", __LINE__);
+        OSSafeReleaseNULL(fwData);
         return false;
     }
-    return false;
+    /* Like Linux (btintel_legacy_rom_setup), the controller keeps working
+     * with its ROM firmware, so this is not a setup failure.
+     */
+    XYLog("Intel firmware patch completed and deactivated\n");
     
 complete:
     OSSafeReleaseNULL(fwData);

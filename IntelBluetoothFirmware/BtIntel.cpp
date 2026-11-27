@@ -155,8 +155,14 @@ waitForVendorEvent(uint8_t subEvent, void *event, uint32_t eventBufSize, uint32_
 
         const uint8_t *bytes = (const uint8_t *)event;
         if (localSize >= 3 && localSize == 2U + bytes[1] && bytes[0] == 0xff && bytes[2] == subEvent) {
-            if (subEvent == 2) return localSize == 9;
-            if (subEvent == 6) return localSize == 7 && !bytes[3] && !bytes[6];
+            /* Like Linux (btintel_bootup / btintel_secure_send_result), a notification with an
+             * unexpected size is ignored and the wait goes on. Bootup is 6 bytes after the
+             * subevent; Secure Send Result is result, opcode (2) and status, and only the
+             * result decides whether the image was accepted (the callers check it). */
+            if ((subEvent == 2 && localSize != 9) || (subEvent == 6 && localSize != 7)) {
+                XYLog("%s ignoring vendor event 0x%02x of size %u\n", __FUNCTION__, subEvent, localSize);
+                continue;
+            }
             return true;
         }
 
@@ -196,7 +202,26 @@ intelSendHCISyncEvent(HciCommandHdr *cmd, void *event, uint32_t eventBufSize, ui
         if (size) {
             *size = localSize;
         }
-        if (localSize >= 1 && *(uint8_t *)event == syncEvent) {
+        const uint8_t *bytes = (const uint8_t *)event;
+        if (localSize < HCI_EVENT_HDR_SIZE || localSize != 2U + bytes[1]) {
+            XYLog("%s malformed event (size %u)\n", __FUNCTION__, localSize);
+            break;
+        }
+        /* Command Complete / Command Status of another opcode (e.g. the 0x0000 NOP sent after a
+         * reset) are not the answer to this command. A failed Command Status for this opcode
+         * ends the wait, as in Linux __hci_cmd_sync_ev(). */
+        bool complete = bytes[0] == HCI_EV_CMD_COMPLETE && localSize >= 5;
+        bool status = bytes[0] == HCI_EV_CMD_STATUS && localSize == 6;
+        if (complete || status) {
+            unsigned offset = complete ? 3 : 4;
+            if ((bytes[offset] | (bytes[offset + 1] << 8)) != OSSwapLittleToHostInt16(cmd->opcode))
+                continue;
+            if (status && bytes[2]) {
+                XYLog("%s cmd 0x%04x failed with HCI status 0x%02x\n", __FUNCTION__, OSSwapLittleToHostInt16(cmd->opcode), bytes[2]);
+                break;
+            }
+        }
+        if (bytes[0] == syncEvent) {
             return true;
         }
     } while (true);
